@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import time
@@ -138,49 +139,64 @@ def run_accurate(capture, writer, client, args, source_fps):
     if not args.no_display:
         print("Press Q or ESC to stop.")
 
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        frame_id += 1
+    def infer(item):
+        number, frame = item
         started = time.perf_counter()
         try:
             result = client.infer(frame, model_id=MODEL_ID) or {"predictions": []}
         except Exception as exc:
-            print(f"Inference warning on frame {frame_id}: {exc}")
+            print(f"Inference warning on frame {number}: {exc}")
             result = {"predictions": []}
-        elapsed = time.perf_counter() - started
-        inference_fps = 1.0 / elapsed if elapsed else 0.0
-        detections = result.get("predictions", [])
-        annotated = draw_predictions(frame, result)
-        cv2.putText(
-            annotated,
-            f"Frame: {frame_id} | Detections: {len(detections)} | Inference FPS: {inference_fps:.2f}",
-            (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA,
-        )
-        cv2.putText(
-            annotated, "ACCURATE: boxes are from this exact frame",
-            (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA,
-        )
+        return number, frame, result, time.perf_counter() - started
 
-        if writer is not None:
-            writer.write(annotated)
-        if not args.no_display:
-            display = annotated
-            if args.display_width > 0 and args.display_height > 0:
-                display = cv2.resize(annotated, (args.display_width, args.display_height))
-            cv2.imshow("Roboflow Road Damage - Accurate Inference", display)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+    # Parallel requests improve throughput, while results are consumed in frame order.
+    # No frames are skipped and every output frame uses its own fresh result.
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        while True:
+            batch = []
+            for _ in range(max(1, args.workers)):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frame_id += 1
+                batch.append((frame_id, frame))
+            if not batch:
                 break
 
-        now = time.perf_counter()
-        if now - last_report > 5:
-            elapsed_total = now - started_total
-            print(
-                f"Processed {frame_id} frames | detections={len(detections)} | "
-                f"average FPS={frame_id / elapsed_total:.2f}"
-            )
-            last_report = now
+            futures = [pool.submit(infer, item) for item in batch]
+            for future in futures:
+                number, frame, result, elapsed = future.result()
+                inference_fps = 1.0 / elapsed if elapsed else 0.0
+                detections = result.get("predictions", [])
+                annotated = draw_predictions(frame, result)
+                cv2.putText(
+                    annotated,
+                    f"Frame: {number} | Detections: {len(detections)} | Inference FPS: {inference_fps:.2f}",
+                    (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA,
+                )
+                cv2.putText(
+                    annotated, "ACCURATE: fresh result for this exact frame",
+                    (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA,
+                )
+
+                if writer is not None:
+                    writer.write(annotated)
+                if not args.no_display:
+                    display = annotated
+                    if args.display_width > 0 and args.display_height > 0:
+                        display = cv2.resize(annotated, (args.display_width, args.display_height))
+                    cv2.imshow("Roboflow Road Damage - Accurate Inference", display)
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                        return
+
+                now = time.perf_counter()
+                if now - last_report > 5:
+                    elapsed_total = now - started_total
+                    print(
+                        f"Processed {number} frames | detections={len(detections)} | "
+                        f"average FPS={number / elapsed_total:.2f} | workers={args.workers}"
+                    )
+                    last_report = now
 
 
 def main():
@@ -196,6 +212,10 @@ def main():
     parser.add_argument(
         "--accurate", action="store_true",
         help="Infer every frame synchronously; best annotation accuracy, but slower playback.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Parallel API requests in accurate mode; every frame is still inferred (default: 4).",
     )
     parser.add_argument("--display-width", type=int, default=1280)
     parser.add_argument("--display-height", type=int, default=720)
