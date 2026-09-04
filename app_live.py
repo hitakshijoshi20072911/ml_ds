@@ -125,6 +125,64 @@ def parse_source(value):
         return value
 
 
+def run_accurate(capture, writer, client, args, source_fps):
+    """Infer every frame so annotations always belong to the displayed frame."""
+    frame_id = 0
+    last_report = time.perf_counter()
+    started_total = time.perf_counter()
+    inference_fps = 0.0
+
+    print(f"Running {MODEL_ID} in ACCURATE mode (one API inference per frame)")
+    print(f"Source={args.source} | source FPS={source_fps:.2f}")
+    print("Accuracy is prioritized; playback speed is limited by API latency.")
+    if not args.no_display:
+        print("Press Q or ESC to stop.")
+
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        frame_id += 1
+        started = time.perf_counter()
+        try:
+            result = client.infer(frame, model_id=MODEL_ID) or {"predictions": []}
+        except Exception as exc:
+            print(f"Inference warning on frame {frame_id}: {exc}")
+            result = {"predictions": []}
+        elapsed = time.perf_counter() - started
+        inference_fps = 1.0 / elapsed if elapsed else 0.0
+        detections = result.get("predictions", [])
+        annotated = draw_predictions(frame, result)
+        cv2.putText(
+            annotated,
+            f"Frame: {frame_id} | Detections: {len(detections)} | Inference FPS: {inference_fps:.2f}",
+            (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated, "ACCURATE: boxes are from this exact frame",
+            (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA,
+        )
+
+        if writer is not None:
+            writer.write(annotated)
+        if not args.no_display:
+            display = annotated
+            if args.display_width > 0 and args.display_height > 0:
+                display = cv2.resize(annotated, (args.display_width, args.display_height))
+            cv2.imshow("Roboflow Road Damage - Accurate Inference", display)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+
+        now = time.perf_counter()
+        if now - last_report > 5:
+            elapsed_total = now - started_total
+            print(
+                f"Processed {frame_id} frames | detections={len(detections)} | "
+                f"average FPS={frame_id / elapsed_total:.2f}"
+            )
+            last_report = now
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fast Roboflow road-damage video inference")
     parser.add_argument("source", help="Video path, webcam index, or stream URL")
@@ -134,6 +192,10 @@ def main():
     parser.add_argument(
         "--detect-every", type=int, default=3,
         help="Run remote detection every N frames (default: 3). Lower for accuracy, higher for speed.",
+    )
+    parser.add_argument(
+        "--accurate", action="store_true",
+        help="Infer every frame synchronously; best annotation accuracy, but slower playback.",
     )
     parser.add_argument("--display-width", type=int, default=1280)
     parser.add_argument("--display-height", type=int, default=720)
@@ -164,7 +226,20 @@ def main():
             capture.release()
             raise RuntimeError(f"Could not create output video: {output_path}")
 
-    detector = LatestFrameDetector(get_client(args.conf, args.iou), args.detect_every)
+    client = get_client(args.conf, args.iou)
+    if args.accurate:
+        try:
+            run_accurate(capture, writer, client, args, source_fps)
+        finally:
+            capture.release()
+            if writer is not None:
+                writer.release()
+            cv2.destroyAllWindows()
+        if args.output:
+            print(f"Saved annotated video: {Path(args.output).resolve()}")
+        return
+
+    detector = LatestFrameDetector(client, args.detect_every)
     detector.start()
     print(f"Running {MODEL_ID} with asynchronous inference")
     print(f"Source={args.source} | source FPS={source_fps:.2f} | detect every {args.detect_every} frame(s)")
